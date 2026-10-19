@@ -231,12 +231,12 @@ details.settings[open] summary::after { content: "–"; }
   <section>
     <div class="row-head">
       <p class="label">Contraseña</p>
-      <span class="lock" id="lock" data-s="unknown">Bloqueado</span>
+      <span class="lock" id="lock" data-s="unknown">Sin verificar</span>
     </div>
     <form class="inline" id="passForm" autocomplete="off">
       <input id="pass" type="password" placeholder="Contraseña del módulo" autocapitalize="off" autocorrect="off" spellcheck="false">
       <button type="button" id="eye" aria-label="Mostrar contraseña">Ver</button>
-      <button type="submit" id="unlock" disabled>Entrar</button>
+      <button type="submit" id="unlock">Guardar</button>
     </form>
   </section>
 
@@ -490,7 +490,7 @@ Aquí verás lo que envías (rojo) y lo que responde el módulo.
     const pm = l.match(/preset\s*[=:#]?\s*([1-5])/);
     if (pm) setActive(+pm[1]);
     const cutM = l.match(/(?:corte|cut)\D{0,12}?(\d{3,5})/);
-    const resM = l.match(/reset\D{0,12}?(\d{3,5})/);
+    const resM = l.match(/(?<![a-z])reset\D{0,12}?(\d{3,5})/);
     if (cutM && resM) {
       // Línea con los dos valores (status o confirmación de preset): actualiza la zona
       if (active) {
@@ -499,9 +499,9 @@ Aquí verás lo que envías (rojo) y lo que responde el módulo.
       }
       return 'info';
     }
-    if (performance.now() < quietUntil && /(cort|cut|reset)/.test(l)) return 'info';
-    if (/(cort|cut)/.test(l) && !/reset/.test(l)) { limiterEvent('cut', cutM ? +cutM[1] : numIn(l)); return 'evt'; }
-    if (/reset/.test(l)) { limiterEvent('reset', resM ? +resM[1] : numIn(l)); return 'evt'; }
+    if (performance.now() < quietUntil && /(cort|cut|(?<![a-z])reset)/.test(l)) return 'info';
+    if (/(cort|cut)/.test(l) && !/(?<![a-z])reset/.test(l)) { limiterEvent('cut', cutM ? +cutM[1] : numIn(l)); return 'evt'; }
+    if (/(?<![a-z])reset/.test(l)) { limiterEvent('reset', resM ? +resM[1] : numIn(l)); return 'evt'; }
     return 'other';
   }
 
@@ -510,7 +510,7 @@ Aquí verás lo que envías (rojo) y lo que responde el módulo.
     $('#status').dataset.s = s;
     $('#statusText').textContent = text;
     const on = s === 'on';
-    document.querySelectorAll('.cmd, .save, #free, #sendBtn, #unlock').forEach(b => b.disabled = !on);
+    document.querySelectorAll('.cmd, .save, #free, #sendBtn').forEach(b => b.disabled = !on);
     const c = $('#connect');
     c.textContent = on ? 'Desconectar' : (s === 'busy' ? 'Conectando…' : 'Conectar');
     c.classList.toggle('primary', !on);
@@ -547,11 +547,10 @@ Aquí verás lo que envías (rojo) y lo que responde el módulo.
       log(`Conectado a ${device.name || 'dispositivo'}`, 'sys');
       loadPresets();
       setLock('unknown');
-      const saved = loadPass();
-      $('#pass').value = saved;
-      if (saved) setTimeout(() => sendPass(), 300);
+      $('#pass').value = loadPass();
+      authEol = store.get('kgb-passeol:' + devKey());
       // Activa el log de cortes para que se mueva la aguja
-      setTimeout(() => send('log=1', false, true), saved ? 900 : 400);
+      setTimeout(() => sendCmd('log=1'), 400);
     } catch (err) {
       setState('off', 'Desconectado');
       if (err && err.name === 'NotFoundError') log('Búsqueda cancelada', 'sys');
@@ -562,13 +561,14 @@ Aquí verás lo que envías (rojo) y lo que responde el módulo.
   function handleLine(line) {
     const kind = interpret(line);
     if (kind === 'auth') checkAuth(line);
+    if (kind !== 'evt' && waiters.length) waiters.shift()(line);
     if (kind !== 'evt' || $('#showLog').checked) log(line, 'rx');
   }
 
   function onDisconnect() {
     setLock('unknown');
-    pendingCmd = null; retried = false;
     rxChar = null;
+    while (waiters.length) waiters.shift()(null);
     target = 0; setPhase('idle');
     setState('off', 'Desconectado');
     log('Conexión perdida', 'sys');
@@ -599,35 +599,87 @@ Aquí verás lo que envías (rojo) y lo que responde el módulo.
   }
 
   // ---------- Contraseña (una por módulo) ----------
-  let pendingCmd = null, retried = false;
+  // Flujo del firmware: orden protegida -> "no tienes la contraseña" -> contraseña -> "contraseña correcta" -> repetir orden
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const waiters = [];
+  function nextLine(ms) {
+    return new Promise(res => {
+      const fn = line => { clearTimeout(t); res(line); };
+      const t = setTimeout(() => { const i = waiters.indexOf(fn); if (i >= 0) waiters.splice(i, 1); res(null); }, ms);
+      waiters.push(fn);
+    });
+  }
+  let authEol = null;
   function loadPass() { return store.get('kgb-pass:' + devKey()) || ''; }
   function savePass(p) { store.set('kgb-pass:' + devKey(), p); }
   function setLock(s) {
     const el = $('#lock');
     el.dataset.s = s;
-    el.textContent = s === 'ok' ? 'Desbloqueado' : s === 'bad' ? 'Incorrecta' : 'Bloqueado';
+    el.textContent = s === 'ok' ? 'Desbloqueado' : s === 'bad' ? 'Incorrecta' : s === 'ask' ? 'Pide contraseña' : 'Sin verificar';
   }
-  function sendPass() {
-    const p = $('#pass').value;
-    if (!p) return Promise.resolve(false);
-    return send(p, true);
+  function authKind(line) {
+    const l = (line || '').toLowerCase();
+    if (l.includes('incorrect')) return 'bad';
+    if (l.includes('correct')) return 'ok';
+    if (l.includes('contrase') || l.includes('password')) return 'ask';
+    return null;
   }
-  function checkAuth(line) {
-    const l = line.toLowerCase();
-    if (l.includes('incorrect')) {
-      setLock('bad'); pendingCmd = null;
-    } else if (l.includes('correct')) {
-      setLock('ok'); savePass($('#pass').value); retried = false;
-      if (pendingCmd) { const c = pendingCmd; pendingCmd = null; setTimeout(() => send(c), 150); }
-    } else {
-      // El módulo pide la contraseña: la enviamos y repetimos la última orden una vez
-      setLock('unknown');
-      if ($('#pass').value && lastCmd && !retried) {
-        retried = true; pendingCmd = lastCmd; sendPass();
+  function checkAuth(line) { const k = authKind(line); if (k) setLock(k); }
+
+  // Envía texto tal cual con el final de línea indicado
+  async function sendRaw(text, end, masked) {
+    if (!rxChar) return false;
+    const data = enc.encode(text + end);
+    try {
+      for (let i = 0; i < data.length; i += 20) {
+        const chunk = data.slice(i, i + 20);
+        if (rxChar.writeValueWithoutResponse && rxChar.properties.writeWithoutResponse) await rxChar.writeValueWithoutResponse(chunk);
+        else if (rxChar.writeValueWithResponse) await rxChar.writeValueWithResponse(chunk);
+        else await rxChar.writeValue(chunk);
       }
+      log(masked ? '••••••' : text, 'tx');
+      return true;
+    } catch (err) { log(`No se pudo enviar: ${err.message || err}`, 'sys'); return false; }
+  }
+  function passEnds() {
+    const list = [];
+    for (const e of [authEol, eol(), '', '\r\n', '\n']) if (e !== null && e !== undefined && !list.includes(e)) list.push(e);
+    return list.slice(0, 3);
+  }
+
+  // Orden con gestión automática de contraseña. Devuelve true si el módulo la aceptó.
+  async function doCmd(cmd) {
+    const ends = passEnds();
+    let tries = 0, unlockedNow = false;
+    while (true) {
+      if (!(await send(cmd))) return false;
+      const reply = await nextLine(1200);
+      if (authKind(reply) !== 'ask') return true;           // aceptada (o sin respuesta)
+      if (unlockedNow) { log('El módulo sigue pidiendo contraseña tras aceptarla.', 'sys'); return false; }
+      const p = $('#pass').value.trim();
+      if (!p) { log('El módulo pide contraseña: escríbela arriba y pulsa Guardar.', 'sys'); return false; }
+      if (tries >= ends.length) { setLock('bad'); log('Contraseña no aceptada. Revisa que esté bien escrita.', 'sys'); return false; }
+      const end = ends[tries++];
+      await sendRaw(p, end, true);
+      const a = authKind(await nextLine(1500));
+      if (a === 'ok') {
+        authEol = end; store.set('kgb-passeol:' + devKey(), end);
+        savePass(p); unlockedNow = true;
+        await sleep(120);
+      }
+      // si fue incorrecta o no reconocida, el bucle repite la orden y prueba la siguiente variante
     }
   }
-  $('#passForm').addEventListener('submit', e => { e.preventDefault(); retried = false; sendPass(); });
+  let queue = Promise.resolve(true);
+  function sendCmd(cmd) { queue = queue.then(() => doCmd(cmd), () => doCmd(cmd)); return queue; }
+
+  $('#passForm').addEventListener('submit', e => {
+    e.preventDefault();
+    const p = $('#pass').value.trim();
+    if (!p) return;
+    savePass(p);
+    log(`Contraseña guardada para ${(device && device.name) || 'este módulo'}. Se enviará sola cuando el módulo la pida.`, 'sys');
+  });
   $('#eye').addEventListener('click', () => {
     const i = $('#pass');
     const show = i.type === 'password';
@@ -636,22 +688,7 @@ Aquí verás lo que envías (rojo) y lo que responde el módulo.
   });
 
   // ---------- Guardar valores en el módulo ----------
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
-  async function ensureUnlocked() {
-    if ($('#lock').dataset.s === 'ok') return true;
-    if (!$('#pass').value) { log('Escribe la contraseña y pulsa Entrar antes de guardar.', 'sys'); return false; }
-    retried = true; // sin reintento automático durante el guardado
-    await sendPass();
-    for (let i = 0; i < 25; i++) {
-      await sleep(100);
-      const s = $('#lock').dataset.s;
-      if (s === 'ok') return true;
-      if (s === 'bad') { log('Contraseña incorrecta: no se ha guardado nada.', 'sys'); return false; }
-    }
-    log('El módulo no confirmó la contraseña: no se ha guardado nada.', 'sys');
-    return false;
-  }
-  async function saveToModule(n, btn) {
+  async function saveToModule(n) {
     const c = parseInt($('#c' + n).value, 10), r = parseInt($('#r' + n).value, 10);
     if (!(c >= 500 && c <= 20000 && r >= 300 && r < c)) {
       log(`M${n}: revisa los valores, el corte tiene que ser mayor que el reset.`, 'sys');
@@ -659,17 +696,14 @@ Aquí verás lo que envías (rojo) y lo que responde el módulo.
     }
     const prev = active;
     document.querySelectorAll('.save').forEach(b => b.disabled = true);
-    quietUntil = performance.now() + 5000;
+    quietUntil = performance.now() + 15000;
     try {
-      if (!(await ensureUnlocked())) return;
-      if (!(await send('preset=' + n))) return;
-      setActive(n); await sleep(350);
-      if (!(await send('corte=' + c))) return;
-      await sleep(350);
-      if (!(await send('reset=' + r))) return;
-      await sleep(350);
+      if (!(await sendCmd('preset=' + n))) { log(`M${n}: no se ha guardado nada.`, 'sys'); return; }
+      setActive(n);
+      if (!(await sendCmd('corte=' + c))) { log(`M${n}: no se pudo guardar el corte.`, 'sys'); return; }
+      if (!(await sendCmd('reset=' + r))) { log(`M${n}: no se pudo guardar el reset.`, 'sys'); return; }
       presets[n] = { cut: c, reset: r }; savePresets(); renderPresets();
-      if (prev && prev !== n) { await sleep(150); if (await send('preset=' + prev)) setActive(prev); }
+      if (prev && prev !== n && (await sendCmd('preset=' + prev))) setActive(prev);
       log(`M${n} guardado en el módulo: corte ${c}, reset ${r}.`, 'sys');
       if (navigator.vibrate) navigator.vibrate([30, 60, 30]);
     } finally {
@@ -677,7 +711,7 @@ Aquí verás lo que envías (rojo) y lo que responde el módulo.
       document.querySelectorAll('.save').forEach(b => b.disabled = !rxChar);
     }
   }
-  document.querySelectorAll('.save').forEach(b => b.addEventListener('click', () => saveToModule(+b.dataset.p, b)));
+  document.querySelectorAll('.save').forEach(b => b.addEventListener('click', () => saveToModule(+b.dataset.p)));
 
   // ---------- Botones ----------
   $('#connect').addEventListener('click', () => {
@@ -685,7 +719,7 @@ Aquí verás lo que envías (rojo) y lo que responde el módulo.
     else connect();
   });
   document.querySelectorAll('.cmd').forEach(b => b.addEventListener('click', async () => {
-    const ok = await send(b.dataset.cmd);
+    const ok = await sendCmd(b.dataset.cmd);
     if (ok && b.dataset.p) setActive(+b.dataset.p);
     if (ok && navigator.vibrate) navigator.vibrate(30);
   }));
